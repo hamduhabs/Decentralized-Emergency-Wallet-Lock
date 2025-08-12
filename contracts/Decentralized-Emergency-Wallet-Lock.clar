@@ -6,11 +6,15 @@
 (define-constant ERR-NOT-LOCKED (err u105))
 (define-constant ERR-COOLDOWN-ACTIVE (err u106))
 (define-constant ERR-INSUFFICIENT-GUARDIANS (err u107))
+(define-constant ERR-CONTACT-ALREADY-EXISTS (err u108))
+(define-constant ERR-CONTACT-NOT-FOUND (err u109))
+(define-constant ERR-MAX-CONTACTS-REACHED (err u110))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var min-guardian-signatures uint u2)
 (define-data-var lock-duration uint u144)
 (define-data-var cooldown-period uint u72)
+(define-data-var max-emergency-contacts uint u5)
 
 (define-map wallet-configs
     principal
@@ -20,7 +24,8 @@
         inactivity-threshold: uint,
         is-locked: bool,
         lock-expiry: uint,
-        guardian-count: uint
+        guardian-count: uint,
+        emergency-contact-count: uint
     }
 )
 
@@ -34,11 +39,28 @@
     bool
 )
 
+(define-map emergency-contacts
+    { wallet: principal, contact: principal }
+    {
+        contact-name: (string-ascii 50),
+        notification-enabled: bool,
+        added-at: uint
+    }
+)
+
+(define-map contact-notifications
+    { wallet: principal, contact: principal, event-type: (string-ascii 20) }
+    {
+        timestamp: uint,
+        notified: bool
+    }
+)
+
 (define-public (initialize-wallet (inactivity-threshold uint))
     (let
         ((wallet tx-sender)
          (existing-config (default-to 
-            { initialized: false, last-activity: u0, inactivity-threshold: u0, is-locked: false, lock-expiry: u0, guardian-count: u0 }
+            { initialized: false, last-activity: u0, inactivity-threshold: u0, is-locked: false, lock-expiry: u0, guardian-count: u0, emergency-contact-count: u0 }
             (map-get? wallet-configs wallet))))
         (asserts! (not (get initialized existing-config)) ERR-ALREADY-INITIALIZED)
         (ok (map-set wallet-configs wallet
@@ -48,7 +70,8 @@
                 inactivity-threshold: inactivity-threshold,
                 is-locked: false,
                 lock-expiry: u0,
-                guardian-count: u0
+                guardian-count: u0,
+                emergency-contact-count: u0
             }))))
 
 (define-public (add-guardian (guardian principal))
@@ -102,6 +125,7 @@
                     is-locked: true,
                     lock-expiry: (+ stacks-block-height (var-get lock-duration))
                 }))
+        (unwrap-panic (notify-emergency-contacts wallet "lock"))
         (ok true)))
 
 (define-public (unlock-wallet)
@@ -116,6 +140,7 @@
                     is-locked: false,
                     lock-expiry: u0
                 }))
+        (unwrap-panic (notify-emergency-contacts wallet "unlock"))
         (ok true)))
 
 (define-read-only (get-wallet-status (wallet principal))
@@ -123,3 +148,56 @@
 
 (define-read-only (is-guardian-of (wallet principal) (guardian principal))
     (ok (default-to false (map-get? wallet-guardians {wallet: wallet, guardian: guardian}))))
+
+(define-public (add-emergency-contact (contact principal) (contact-name (string-ascii 50)))
+    (let
+        ((wallet tx-sender)
+         (config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED)))
+        (asserts! (not (get is-locked config)) ERR-ALREADY-LOCKED)
+        (asserts! (< (get emergency-contact-count config) (var-get max-emergency-contacts)) ERR-MAX-CONTACTS-REACHED)
+        (asserts! (is-none (map-get? emergency-contacts {wallet: wallet, contact: contact})) ERR-CONTACT-ALREADY-EXISTS)
+        (map-set emergency-contacts {wallet: wallet, contact: contact}
+            {
+                contact-name: contact-name,
+                notification-enabled: true,
+                added-at: stacks-block-height
+            })
+        (map-set wallet-configs wallet
+            (merge config {emergency-contact-count: (+ (get emergency-contact-count config) u1)}))
+        (ok true)))
+
+(define-public (remove-emergency-contact (contact principal))
+    (let
+        ((wallet tx-sender)
+         (config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED)))
+        (asserts! (not (get is-locked config)) ERR-ALREADY-LOCKED)
+        (asserts! (is-some (map-get? emergency-contacts {wallet: wallet, contact: contact})) ERR-CONTACT-NOT-FOUND)
+        (map-delete emergency-contacts {wallet: wallet, contact: contact})
+        (map-set wallet-configs wallet
+            (merge config {emergency-contact-count: (- (get emergency-contact-count config) u1)}))
+        (ok true)))
+
+(define-public (toggle-contact-notifications (contact principal))
+    (let
+        ((wallet tx-sender)
+         (existing-contact (unwrap! (map-get? emergency-contacts {wallet: wallet, contact: contact}) ERR-CONTACT-NOT-FOUND)))
+        (map-set emergency-contacts {wallet: wallet, contact: contact}
+            (merge existing-contact {notification-enabled: (not (get notification-enabled existing-contact))}))
+        (ok true)))
+
+(define-private (notify-emergency-contacts (wallet principal) (event-type (string-ascii 20)))
+    (begin
+        (map-set contact-notifications {wallet: wallet, contact: wallet, event-type: event-type}
+            {timestamp: stacks-block-height, notified: true})
+        (ok true)))
+
+(define-read-only (get-emergency-contact (wallet principal) (contact principal))
+    (ok (map-get? emergency-contacts {wallet: wallet, contact: contact})))
+
+(define-read-only (get-emergency-contact-count (wallet principal))
+    (let
+        ((config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED)))
+        (ok (get emergency-contact-count config))))
+
+(define-read-only (is-emergency-contact (wallet principal) (contact principal))
+    (ok (is-some (map-get? emergency-contacts {wallet: wallet, contact: contact}))))
