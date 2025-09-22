@@ -99,9 +99,12 @@
 (define-public (vote-lock (wallet principal))
     (let
         ((guardian tx-sender)
-         (config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED)))
+         (config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED))
+         (has-voted (default-to false (map-get? guardian-votes {wallet: wallet, guardian: guardian}))))
         (asserts! (default-to false (map-get? wallet-guardians {wallet: wallet, guardian: guardian})) ERR-INVALID-GUARDIAN)
+        (asserts! (not has-voted) ERR-INVALID-GUARDIAN)
         (map-set guardian-votes {wallet: wallet, guardian: guardian} true)
+        (increment-vote-tally wallet)
         (try-lock wallet)))
 
 (define-private (try-lock (wallet principal))
@@ -112,8 +115,22 @@
             (lock-wallet wallet)
             (ok false))))
 
+(define-map vote-tallies
+    principal
+    uint
+)
+
 (define-private (count-votes-for-wallet (wallet principal))
-    u0)
+    (default-to u0 (map-get? vote-tallies wallet)))
+
+(define-private (increment-vote-tally (wallet principal))
+    (let
+        ((current-votes (default-to u0 (map-get? vote-tallies wallet))))
+        (map-set vote-tallies wallet (+ current-votes u1))
+        (+ current-votes u1)))
+
+(define-private (reset-vote-tally (wallet principal))
+    (map-delete vote-tallies wallet))
 
 (define-private (lock-wallet (wallet principal))
     (let
@@ -125,6 +142,7 @@
                     is-locked: true,
                     lock-expiry: (+ stacks-block-height (var-get lock-duration))
                 }))
+        (reset-vote-tally wallet)
         (unwrap-panic (notify-emergency-contacts wallet "lock"))
         (ok true)))
 
@@ -201,3 +219,61 @@
 
 (define-read-only (is-emergency-contact (wallet principal) (contact principal))
     (ok (is-some (map-get? emergency-contacts {wallet: wallet, contact: contact}))))
+
+(define-public (update-activity)
+    (let
+        ((wallet tx-sender)
+         (config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED)))
+        (asserts! (not (get is-locked config)) ERR-ALREADY-LOCKED)
+        (map-set wallet-configs wallet
+            (merge config {last-activity: stacks-block-height}))
+        (ok true)))
+
+(define-public (check-inactivity (wallet principal))
+    (let
+        ((config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED))
+         (current-block stacks-block-height)
+         (last-activity (get last-activity config))
+         (threshold (get inactivity-threshold config)))
+        (asserts! (not (get is-locked config)) ERR-ALREADY-LOCKED)
+        (if (and (> threshold u0) (>= (- current-block last-activity) threshold))
+            (auto-lock-inactive-wallet wallet)
+            (ok false))))
+
+(define-private (auto-lock-inactive-wallet (wallet principal))
+    (let
+        ((config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED)))
+        (map-set wallet-configs wallet
+            (merge config 
+                {
+                    is-locked: true,
+                    lock-expiry: (+ stacks-block-height (var-get lock-duration))
+                }))
+        (unwrap-panic (notify-emergency-contacts wallet "inactivity-lock"))
+        (ok true)))
+
+(define-read-only (get-activity-status (wallet principal))
+    (let
+        ((config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED))
+         (current-block stacks-block-height)
+         (last-activity (get last-activity config))
+         (threshold (get inactivity-threshold config))
+         (blocks-inactive (- current-block last-activity)))
+        (ok {
+            last-activity: last-activity,
+            blocks-inactive: blocks-inactive,
+            inactivity-threshold: threshold,
+            is-at-risk: (and (> threshold u0) (>= blocks-inactive (/ (* threshold u4) u5))),
+            will-auto-lock: (and (> threshold u0) (>= blocks-inactive threshold))
+        })))
+
+(define-read-only (get-blocks-until-auto-lock (wallet principal))
+    (let
+        ((config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED))
+         (current-block stacks-block-height)
+         (last-activity (get last-activity config))
+         (threshold (get inactivity-threshold config))
+         (blocks-inactive (- current-block last-activity)))
+        (if (and (> threshold u0) (< blocks-inactive threshold))
+            (ok (- threshold blocks-inactive))
+            (ok u0))))
