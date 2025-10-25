@@ -9,12 +9,16 @@
 (define-constant ERR-CONTACT-ALREADY-EXISTS (err u108))
 (define-constant ERR-CONTACT-NOT-FOUND (err u109))
 (define-constant ERR-MAX-CONTACTS-REACHED (err u110))
+(define-constant ERR-RECOVERY-NOT-INITIATED (err u111))
+(define-constant ERR-RECOVERY-DELAY-NOT-MET (err u112))
+(define-constant ERR-RECOVERY-ALREADY-INITIATED (err u113))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var min-guardian-signatures uint u2)
 (define-data-var lock-duration uint u144)
 (define-data-var cooldown-period uint u72)
 (define-data-var max-emergency-contacts uint u5)
+(define-data-var recovery-delay-blocks uint u1008)
 
 (define-map wallet-configs
     principal
@@ -53,6 +57,16 @@
     {
         timestamp: uint,
         notified: bool
+    }
+)
+
+(define-map recovery-keys
+    principal
+    {
+        recovery-principal: principal,
+        delay-blocks: uint,
+        initiated-at: uint,
+        is-active: bool
     }
 )
 
@@ -276,4 +290,79 @@
          (blocks-inactive (- current-block last-activity)))
         (if (and (> threshold u0) (< blocks-inactive threshold))
             (ok (- threshold blocks-inactive))
+            (ok u0))))
+
+(define-public (set-recovery-key (recovery-principal principal))
+    (let
+        ((wallet tx-sender)
+         (config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED)))
+        (asserts! (not (get is-locked config)) ERR-ALREADY-LOCKED)
+        (map-set recovery-keys wallet
+            {
+                recovery-principal: recovery-principal,
+                delay-blocks: (var-get recovery-delay-blocks),
+                initiated-at: u0,
+                is-active: false
+            })
+        (ok true)))
+
+(define-public (initiate-recovery (wallet principal))
+    (let
+        ((recovery-data (unwrap! (map-get? recovery-keys wallet) ERR-NOT-AUTHORIZED))
+         (config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED)))
+        (asserts! (is-eq tx-sender (get recovery-principal recovery-data)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get is-active recovery-data)) ERR-RECOVERY-ALREADY-INITIATED)
+        (map-set recovery-keys wallet
+            (merge recovery-data 
+                {
+                    initiated-at: stacks-block-height,
+                    is-active: true
+                }))
+        (unwrap-panic (notify-emergency-contacts wallet "recovery-initiated"))
+        (ok true)))
+
+(define-public (execute-recovery (wallet principal))
+    (let
+        ((recovery-data (unwrap! (map-get? recovery-keys wallet) ERR-NOT-AUTHORIZED))
+         (config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED))
+         (current-block stacks-block-height))
+        (asserts! (is-eq tx-sender (get recovery-principal recovery-data)) ERR-NOT-AUTHORIZED)
+        (asserts! (get is-active recovery-data) ERR-RECOVERY-NOT-INITIATED)
+        (asserts! (>= (- current-block (get initiated-at recovery-data)) (get delay-blocks recovery-data)) ERR-RECOVERY-DELAY-NOT-MET)
+        (map-set wallet-configs wallet
+            (merge config 
+                {
+                    is-locked: false,
+                    lock-expiry: u0
+                }))
+        (map-set recovery-keys wallet
+            (merge recovery-data {is-active: false, initiated-at: u0}))
+        (reset-vote-tally wallet)
+        (unwrap-panic (notify-emergency-contacts wallet "recovery-executed"))
+        (ok true)))
+
+(define-public (cancel-recovery)
+    (let
+        ((wallet tx-sender)
+         (recovery-data (unwrap! (map-get? recovery-keys wallet) ERR-NOT-AUTHORIZED)))
+        (asserts! (get is-active recovery-data) ERR-RECOVERY-NOT-INITIATED)
+        (map-set recovery-keys wallet
+            (merge recovery-data {is-active: false, initiated-at: u0}))
+        (unwrap-panic (notify-emergency-contacts wallet "recovery-cancelled"))
+        (ok true)))
+
+(define-read-only (get-recovery-status (wallet principal))
+    (ok (map-get? recovery-keys wallet)))
+
+(define-read-only (get-blocks-until-recovery (wallet principal))
+    (let
+        ((recovery-data (unwrap! (map-get? recovery-keys wallet) ERR-NOT-AUTHORIZED))
+         (current-block stacks-block-height))
+        (if (get is-active recovery-data)
+            (let
+                ((blocks-passed (- current-block (get initiated-at recovery-data)))
+                 (delay-required (get delay-blocks recovery-data)))
+                (if (>= blocks-passed delay-required)
+                    (ok u0)
+                    (ok (- delay-required blocks-passed))))
             (ok u0))))
