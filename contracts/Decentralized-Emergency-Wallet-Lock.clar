@@ -12,6 +12,11 @@
 (define-constant ERR-RECOVERY-NOT-INITIATED (err u111))
 (define-constant ERR-RECOVERY-DELAY-NOT-MET (err u112))
 (define-constant ERR-RECOVERY-ALREADY-INITIATED (err u113))
+(define-constant ERR-TRANSACTION-NOT-FOUND (err u114))
+(define-constant ERR-TRANSACTION-EXPIRED (err u115))
+(define-constant ERR-ALREADY-APPROVED (err u116))
+(define-constant ERR-INSUFFICIENT-APPROVALS (err u117))
+(define-constant ERR-TRANSACTION-ALREADY-EXECUTED (err u118))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var min-guardian-signatures uint u2)
@@ -19,6 +24,8 @@
 (define-data-var cooldown-period uint u72)
 (define-data-var max-emergency-contacts uint u5)
 (define-data-var recovery-delay-blocks uint u1008)
+(define-data-var transaction-expiry-blocks uint u144)
+(define-data-var transaction-nonce uint u0)
 
 (define-map wallet-configs
     principal
@@ -68,6 +75,25 @@
         initiated-at: uint,
         is-active: bool
     }
+)
+
+(define-map pending-transactions
+    { wallet: principal, tx-id: uint }
+    {
+        recipient: principal,
+        amount: uint,
+        memo: (string-ascii 100),
+        created-at: uint,
+        expiry: uint,
+        approval-count: uint,
+        required-approvals: uint,
+        executed: bool
+    }
+)
+
+(define-map transaction-approvals
+    { wallet: principal, tx-id: uint, guardian: principal }
+    bool
 )
 
 (define-public (initialize-wallet (inactivity-threshold uint))
@@ -366,3 +392,63 @@
                     (ok u0)
                     (ok (- delay-required blocks-passed))))
             (ok u0))))
+
+(define-public (propose-transaction (recipient principal) (amount uint) (memo (string-ascii 100)) (required-approvals uint))
+    (let
+        ((wallet tx-sender)
+         (config (unwrap! (map-get? wallet-configs wallet) ERR-NOT-INITIALIZED))
+         (tx-id (var-get transaction-nonce)))
+        (asserts! (get initialized config) ERR-NOT-INITIALIZED)
+        (asserts! (>= (get guardian-count config) required-approvals) ERR-INSUFFICIENT-GUARDIANS)
+        (var-set transaction-nonce (+ tx-id u1))
+        (map-set pending-transactions { wallet: wallet, tx-id: tx-id }
+            {
+                recipient: recipient,
+                amount: amount,
+                memo: memo,
+                created-at: stacks-block-height,
+                expiry: (+ stacks-block-height (var-get transaction-expiry-blocks)),
+                approval-count: u0,
+                required-approvals: required-approvals,
+                executed: false
+            })
+        (ok tx-id)))
+
+(define-public (approve-transaction (wallet principal) (tx-id uint))
+    (let
+        ((guardian tx-sender)
+         (tx-data (unwrap! (map-get? pending-transactions { wallet: wallet, tx-id: tx-id }) ERR-TRANSACTION-NOT-FOUND))
+         (has-approved (default-to false (map-get? transaction-approvals { wallet: wallet, tx-id: tx-id, guardian: guardian }))))
+        (asserts! (default-to false (map-get? wallet-guardians { wallet: wallet, guardian: guardian })) ERR-INVALID-GUARDIAN)
+        (asserts! (not (get executed tx-data)) ERR-TRANSACTION-ALREADY-EXECUTED)
+        (asserts! (< stacks-block-height (get expiry tx-data)) ERR-TRANSACTION-EXPIRED)
+        (asserts! (not has-approved) ERR-ALREADY-APPROVED)
+        (map-set transaction-approvals { wallet: wallet, tx-id: tx-id, guardian: guardian } true)
+        (map-set pending-transactions { wallet: wallet, tx-id: tx-id }
+            (merge tx-data { approval-count: (+ (get approval-count tx-data) u1) }))
+        (ok true)))
+
+(define-public (execute-transaction (tx-id uint))
+    (let
+        ((wallet tx-sender)
+         (tx-data (unwrap! (map-get? pending-transactions { wallet: wallet, tx-id: tx-id }) ERR-TRANSACTION-NOT-FOUND)))
+        (asserts! (not (get executed tx-data)) ERR-TRANSACTION-ALREADY-EXECUTED)
+        (asserts! (< stacks-block-height (get expiry tx-data)) ERR-TRANSACTION-EXPIRED)
+        (asserts! (>= (get approval-count tx-data) (get required-approvals tx-data)) ERR-INSUFFICIENT-APPROVALS)
+        (map-set pending-transactions { wallet: wallet, tx-id: tx-id }
+            (merge tx-data { executed: true }))
+        (ok true)))
+
+(define-public (revoke-transaction (tx-id uint))
+    (let
+        ((wallet tx-sender)
+         (tx-data (unwrap! (map-get? pending-transactions { wallet: wallet, tx-id: tx-id }) ERR-TRANSACTION-NOT-FOUND)))
+        (asserts! (not (get executed tx-data)) ERR-TRANSACTION-ALREADY-EXECUTED)
+        (map-delete pending-transactions { wallet: wallet, tx-id: tx-id })
+        (ok true)))
+
+(define-read-only (get-transaction (wallet principal) (tx-id uint))
+    (ok (map-get? pending-transactions { wallet: wallet, tx-id: tx-id })))
+
+(define-read-only (has-approved-transaction (wallet principal) (tx-id uint) (guardian principal))
+    (ok (default-to false (map-get? transaction-approvals { wallet: wallet, tx-id: tx-id, guardian: guardian }))))
